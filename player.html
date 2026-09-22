@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<style>
+  body { font: 15px system-ui; margin: 0; color: #555; }
+  audio { width: 100%; margin: 12px 0; }
+  button { padding: 12px; border: 1px solid #aaa; border-radius: 8px; font: inherit; }
+  #play { cursor: pointer; }
+  #triggers { display: grid; grid-template-columns: repeat(auto-fit, minmax(45px, 1fr)); gap: 6px; }
+  .trigger { background: #eee; color: #555; padding: 12px 0; opacity: 1; }
+  .trigger.active { background: #22c55e; color: #052e16; border-color: #16a34a; box-shadow: 0 0 10px #22c55e80; }
+  #status { margin-top: 12px; }
+</style>
+<button id="play" type="button">Play song</button>
+<audio id="audio" controls preload="metadata" src="data:audio/wav;base64,__AUDIO__"></audio>
+<div id="triggers" aria-label="Cluster triggers"></div>
+<div id="status">Ready</div>
+<script>
+const labels = __LABELS__;
+const frameSeconds = __FRAME_SECONDS__;
+const audio = document.getElementById('audio');
+const play = document.getElementById('play');
+const status = document.getElementById('status');
+const triggers = document.getElementById('triggers');
+const buttons = Array.from({length: __N_CLUSTERS__}, (_, label) => {
+  const button = document.createElement('button');
+  button.className = 'trigger';
+  button.textContent = label;
+  button.disabled = true;
+  button.setAttribute('aria-label', `Cluster ${label}`);
+  button.setAttribute('aria-pressed', 'false');
+  triggers.appendChild(button);
+  return button;
+});
+let animation;
+function update() {
+  const index = Math.floor(audio.currentTime / frameSeconds);
+  const label = !audio.paused && !audio.ended && !audio.seeking && labels[index] >= 0 ? labels[index] : undefined;
+  buttons.forEach((button, i) => {
+    button.classList.toggle('active', i === label);
+    button.setAttribute('aria-pressed', String(i === label));
+  });
+  play.textContent = audio.paused || audio.ended ? 'Play song' : 'Pause';
+  status.textContent = `Frame ${index} · Cluster ${label === undefined ? '—' : label}`;
+}
+function tick() {
+  update();
+  if (!audio.paused && !audio.ended) animation = requestAnimationFrame(tick);
+}
+play.onclick = async () => {
+  if (!audio.paused) return audio.pause();
+  try { await audio.play(); }
+  catch (error) { status.textContent = `Playback failed: ${error.message}`; }
+};
+audio.addEventListener('play', () => { cancelAnimationFrame(animation); tick(); });
+['pause', 'ended'].forEach(event => audio.addEventListener(event, () => {
+  cancelAnimationFrame(animation);
+  update();
+}));
+['seeking', 'seeked', 'timeupdate'].forEach(event => audio.addEventListener(event, update));
+audio.addEventListener('error', () => { status.textContent = 'Could not play this audio.'; });
+</script>
+</html>
