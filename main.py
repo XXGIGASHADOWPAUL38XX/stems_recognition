@@ -7,9 +7,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.io import wavfile
 from numba import njit, prange
-from sklearn.cluster import HDBSCAN
 from sklearn.decomposition import PCA
-from features import (get_abs_amp_features, get_mb_entropy, get_mb_onset,
+from sklearn.cluster import KMeans
+from features import (normalize, get_multibands, get_abs_amp_features, get_mb_entropy, get_mb_onset,
                       get_mb_s_centroid, get_mb_s_flux, get_mb_zcr,
                       get_mb_mid_side_e, get_mb_crest_factor)
 
@@ -80,29 +80,24 @@ def group_amplitudes_frames(amplitudes, nb_frames):
 def get_abs_difference(amplitudes):
     return np.clip(amplitudes[1:] - amplitudes[:-1], 0, 1)
 
+
+def get_data_difference(data, split_size=0.2):
+    difference = np.concatenate([
+        band - band.mean(axis=(0, 1), keepdims=True) if band.size else band.copy()
+        for band in get_multibands(data, split_size)
+    ], axis=1)
+    useless_values_indexes = np.where(np.all(difference == 0, axis=(0, 2)))[0]
+    dims = np.where((np.isin(np.arange(data.shape[1]), useless_values_indexes)==False), True, False)
+    return difference.transpose(1, 0, 2)[dims].transpose(1, 0, 2)
+
 @njit(cache=True)
-def filter_abs_difference(abs_difference, threshold=2):
-    sums = abs_difference.sum(axis=0)
-    for i in range(abs_difference.shape[0]):
-        for k in range(abs_difference.shape[1]):
+def filter_difference(difference, threshold=2):
+    sums = difference.sum(axis=0)
+    for i in range(difference.shape[0]):
+        for k in range(difference.shape[1]):
             if sums[k] < threshold:
-                abs_difference[i, k] = 0
-    return abs_difference
-
-
-@njit(cache=True)
-def roll_to_normalize_freq(amplitudes):
-    length, bands = amplitudes.shape
-    out = np.empty_like(amplitudes)
-    for i in range(length):
-        first = 0
-        for k in range(bands):
-            if amplitudes[i, k] >= 0.0002:
-                first = k
-                break
-        for k in range(bands):
-            out[i, k] = amplitudes[i, (k + first) % bands]
-    return out
+                difference[i, k] = 0
+    return difference
 
 
 def multiline(d):
@@ -114,111 +109,93 @@ def multiline(d):
     plt.show()
 
 
-def hdbscan_difference(abs_differences, min_cluster_size=10, min_samples=5, cluster_selection_epsilon=0.0, alpha=1.0, metric="euclidean", algorithm="auto", power=0.5):
-    if min_cluster_size < 2 or min_samples < 1:
-        raise ValueError("min_cluster_size must be at least 2 and min_samples at least 1")
-    if len(abs_differences) < max(min_cluster_size, min_samples):
-        return np.full(len(abs_differences), -1, dtype=int)
-    x = abs_differences.reshape(len(abs_differences), -1)
-    x = np.sign(x) * np.abs(x) ** power
-    X_norm = x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
 
-    return HDBSCAN(
-        algorithm=algorithm,
-        metric=metric,
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        cluster_selection_method="leaf"
-    ).fit_predict(X_norm)
+@njit(cache=True, parallel=True)
+def _canopy_labels(x, order, t1, t2):
+    n, dimensions = x.shape
+    remaining = np.ones(n, dtype=np.bool_)
+    centers = []
+    for seed in order:
+        if not remaining[seed]:
+            continue
+        center = np.zeros(dimensions)
+        count = 0
+        for i in range(n):
+            squared_distance = 0.0
+            for k in range(dimensions):
+                squared_distance += (x[i, k] - x[seed, k]) ** 2
+            distance = np.sqrt(squared_distance)
+            if distance < t1:
+                for k in range(dimensions):
+                    center[k] += x[i, k]
+                count += 1
+            if distance < t2:
+                remaining[i] = False
+        centers.append(center / count)
+
+    labels = np.empty(n, dtype=np.int64)
+    for i in prange(n):
+        closest, best = 0, np.inf
+        for j in range(len(centers)):
+            distance = 0.0
+            for k in range(dimensions):
+                distance += (x[i, k] - centers[j][k]) ** 2
+            if distance < best:
+                closest, best = j, distance
+        labels[i] = closest
+    return labels
 
 
-def plot_clusters_2d(abs_differences, labels):
-    abs_differences = abs_differences.reshape(len(abs_differences), -1)
-    pca = PCA(n_components=2)
-    X_2d = pca.fit_transform(abs_differences)
+def canopy_difference(differences, t1=1.0, t2=0.5):
+    """Build overlapping Euclidean canopies, then assign to their nearest centroid."""
+    if not np.isfinite(t1) or not np.isfinite(t2) or not 0 < t2 < t1:
+        raise ValueError("Canopy thresholds must satisfy 0 < t2 < t1 and be finite")
+    if len(differences) == 0:
+        return np.empty(0, dtype=int)
+    x = np.asarray(differences, dtype=float).reshape(len(differences), -1)
+    if x.shape[1] == 0:
+        return np.full(len(x), -1, dtype=int)
+    if not np.isfinite(x).all():
+        raise ValueError("Clustering input must be finite")
+    order = np.random.default_rng(42).permutation(len(x))
+    labels = _canopy_labels(np.ascontiguousarray(x), order, t1, t2)
+    return np.unique(labels, return_inverse=True)[1]
 
-    plt.figure()
-    plt.scatter(X_2d[:, 0], X_2d[:, 1], c=labels, cmap="tab10", s=1, linewidths=0)
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
+
+def kmeans_difference(features, n_clusters):
+    if n_clusters == 0:
+        return np.full(len(features), -1, dtype=int)
+    return KMeans(n_clusters=n_clusters, n_init=10, random_state=42).fit_predict(features)
+
+
+def pca_difference(differences):
+    if len(differences) == 0:
+        return np.empty((0, 3))
+    differences = differences.reshape(len(differences), -1)
+    if differences.shape[1] == 0:
+        return np.empty((len(differences), 0))
+    if len(differences) == 1:
+        return np.zeros((1, 3))
+    differences = np.ascontiguousarray(differences, dtype=np.float32)
+    components = min(3, *differences.shape)
+    embedding = PCA(n_components=components).fit_transform(differences)
+    return np.pad(embedding, ((0, 0), (0, 3 - components)))
+
+
+def plot_clusters_3d(X_3d, labels=None):
+    if X_3d.size == 0:
+        return
+    ax = plt.figure().add_subplot(projection="3d")
+    colors = {} if labels is None else dict(c=labels, cmap="tab10")
+    ax.scatter(X_3d[:, 0], X_3d[:, 1], X_3d[:, 2], s=1, linewidths=0, **colors)
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_zlabel("PC3")
+    ax.set_xlim(-1.5, 1.5)
+    ax.set_ylim(-1.5, 1.5)
+    ax.set_zlim(-1.5, 1.5)
     plt.show()
 
-@njit(cache=True, parallel=True)
-def compute_similarity(x):
-    n, bands = x.shape
-    similarity = np.zeros((n, n))
-    for i in prange(n):
-        for j in range(i + 1, n):
-            intersection = 0.0
-            union = 0.0
-            for k in range(bands):
-                intersection += min(x[i, k], x[j, k])
-                union += max(x[i, k], x[j, k])
-            similarity[i, j] = (intersection + 1e-8) / (union + 1e-6)
-    return similarity
-
-
-def get_similarity(abs_difference, threshold=0.5):
-    x = np.ascontiguousarray(abs_difference, dtype=np.float64) ** 3
-    similarity = compute_similarity(x)
-    return similarity, *np.where(np.triu(similarity > threshold, k=1))
-
-
-@njit(cache=True)
-def get_stems(amplitudes, frequencies, rows, cols):
-    groups = 0
-    for i in range(rows.size):
-        if i == 0 or rows[i] != rows[i - 1]:
-            groups += 1
-    out = np.full((groups, amplitudes.shape[1]), np.inf)
-    group = -1
-    for i in range(rows.size):
-        if i == 0 or rows[i] != rows[i - 1]:
-            group += 1
-        for k in range(amplitudes.shape[1]):
-            out[group, k] = np.minimum(out[group, k], amplitudes[cols[i], k])
-    return out
-
-
-@njit(cache=False)
-def filter_stems(stems, rows, cols, level=0.25, counts=10, min_distance=100):
-    distant_counts = np.zeros(stems.shape[0], dtype=np.int64)
-    group = -1
-    for i in range(rows.size):
-        if i == 0 or rows[i] != rows[i - 1]:
-            group += 1
-        if abs(cols[i] - rows[i]) > min_distance:
-            distant_counts[group] += 1
-    mask = (stems.sum(axis=1) > level) & (distant_counts > counts)
-    return stems[mask], mask
-
-@njit(cache=True, parallel=True)
-def _stem_presence(amplitudes, stems):
-    present = np.empty((stems.shape[0], amplitudes.shape[0]), dtype=np.bool_)
-    for j in prange(stems.shape[0]):
-        for i in range(amplitudes.shape[0]):
-            present[j, i] = True
-            for k in range(amplitudes.shape[1]):
-                if not amplitudes[i, k] >= stems[j, k]:
-                    present[j, i] = False
-                    break
-    return present
-
-
-def find_stems(normalized_freq_pitches, stems, stems_power):
-    amplitudes = np.power(normalized_freq_pitches, stems_power)
-    present = _stem_presence(amplitudes, stems)
-    return [np.flatnonzero(row) for row in present]
-
-
-# def gather_stems(group_stems, similarity_matrix):
-#     unique = np.unique(functools.reduce(lambda a, b: np.hstack((a, b)), group_stems))
-#     similarity_matrix[unique[:, None], unique[None, :]]
-#     cumulated_score = 0
-#     for group in group_stems:
-#         for stem in group:
-#
-#     return stems
 
 
 def play_segments(indices, audio, sample_rate, hop_ms=10, duration=0.25, frames_per_group=2):
@@ -228,83 +205,59 @@ def play_segments(indices, audio, sample_rate, hop_ms=10, duration=0.25, frames_
     output = io.BytesIO()
     wavfile.write(output, sample_rate, np.concatenate(clips).astype(np.float32))
     return output.getvalue()
-#
-#
-# def filter_clusters(labels, mb_onset, n_clusters):
-#     argsort = labels.argsort()
-#     sorted_labels = labels[argsort]
-#     indices = np.hstack(([0] ,np.flatnonzero(sorted_labels[:-1] != sorted_labels[1:]) + 1, labels.shape[-1] - 1))
-#     avg_onsets = []
-#     for b, n in pairwise(indices):
-#         avg_onsets.append(np.mean(mb_onset.T[argsort][b:n]))
-#     keep = np.argsort(avg_onsets)[:n_clusters]
-#     return np.where(np.isin(labels, keep), labels, -1)
-
 def recognize_stems(
         audio,
         sample_rate,
         frames_per_group=2,
         progress=None,
         n_bands=200,
-        min_cluster_size=10,
-        min_samples=5,
-        split_size=0.05,
-        cluster_selection_epsilon=0.0,
-        alpha=1.0,
-        metric="euclidean",
-        algorithm="auto",
+        t1=1.0,
+        t2=0.5,
         power=0.5,
+        split_size=0.2,
 ):
     if n_bands < 1:
         raise ValueError("n_bands must be positive")
-    if min_cluster_size < 2 or min_samples < 2:
-        raise ValueError("min_cluster_size must be at least 2 and min_samples at least 2")
     step = 0
 
     def run(label, function, *args, **kwargs):
         nonlocal step
         if progress is not None:
-            progress(step / 14, label)
+            progress(step / 19, label)
         result = function(*args, **kwargs)
         step += 1
         return result
 
     frequencies, amplitudes, spectrum, fft_bands = run("Computing the Fourier transform…", fourier_transform, audio, sample_rate, n_bands=n_bands, return_spectrum=True)
-    average_grouped_amplitudes = run("Grouping the amplitudes frames…", group_amplitudes_frames, amplitudes, frames_per_group)
-    abs_differences = run("Getting frames absolute difference…", get_abs_difference, average_grouped_amplitudes)
-    max_amplitude, count_amplitudes, avg_amplitude_fq, std_amplitudes = run("Computing amplitude features…", get_abs_amp_features, abs_differences, frequencies)
-    mb_entropy = run("Computing band entropy…", get_mb_entropy, average_grouped_amplitudes, split_size=split_size)
-    mb_onset = run("Computing band onset…", get_mb_onset, average_grouped_amplitudes, split_size=split_size)
-    mb_s_centroid = run("Computing band centroids…", get_mb_s_centroid, average_grouped_amplitudes, frequencies, split_size=split_size)
-    mb_s_flux = run("Computing spectral flux…", get_mb_s_flux, average_grouped_amplitudes, split_size=split_size)
-    mb_zcr = run("Computing row sign changes…", get_mb_zcr, average_grouped_amplitudes, split_size=split_size)
-    mb_mid_side_e = run("Computing stereo mid/side energy…", get_mb_mid_side_e, spectrum, fft_bands, n_bands, split_size=split_size)
-    mb_mid_side_e = run("Grouping mid/side energy…", group_amplitudes_frames, mb_mid_side_e.T, frames_per_group).T
-    mb_crest_factor = run("Computing crest factors…", get_mb_crest_factor, average_grouped_amplitudes, split_size=split_size)
-    # Match the original frame alignment and the length of abs_differences.
-    mb_entropy, mb_onset, mb_s_centroid, mb_s_flux, mb_zcr, mb_mid_side_e, mb_crest_factor = (
-        feature[:, :-1] for feature in
-        (mb_entropy, mb_onset, mb_s_centroid, mb_s_flux, mb_zcr, mb_mid_side_e, mb_crest_factor)
-    )
-    features = np.vstack((
-        max_amplitude[None, :],
-        count_amplitudes[None, :],
-        avg_amplitude_fq[None, :],
-        std_amplitudes[None, :],
-        mb_entropy,
-        mb_onset,
-        mb_s_centroid,
-        mb_s_flux,
-        mb_zcr,
-        mb_mid_side_e,
-        mb_crest_factor,
-    )).T
+    grouped = run("Grouping the amplitudes frames…", group_amplitudes_frames, amplitudes, frames_per_group)
+    if len(grouped) < 2:
+        raise ValueError("Audio must contain at least two grouped frames")
+    abs_amplitudes = run("Computing absolute differences…", get_abs_difference, grouped)
+    amplitude_differences = run("Centering amplitudes…", get_data_difference, grouped, split_size)
+    amplitude_differences = run("Normalizing amplitude differences…", normalize, amplitude_differences, 1, power)
+    differences = run("Centering absolute differences…", get_data_difference, abs_amplitudes, split_size)
+    differences = run("Normalizing differences…", normalize, differences, 1, power)
+    amplitude_features = run("Computing amplitude features…", get_abs_amp_features, grouped, frequencies, power=power)
+    kwargs = dict(split_size=split_size, power=power)
+    mb_entropy = run("Computing band entropy…", get_mb_entropy, grouped, **kwargs)
+    mb_onset = run("Computing band onset…", get_mb_onset, grouped, **kwargs)
+    mb_centroid = run("Computing band centroids…", get_mb_s_centroid, grouped, frequencies, **kwargs)
+    mb_flux = run("Computing spectral flux…", get_mb_s_flux, grouped, **kwargs)
+    mb_zcr = run("Computing row sign changes…", get_mb_zcr, grouped, **kwargs)
+    mb_energy = run("Computing stereo mid/side energy…", get_mb_mid_side_e, spectrum, fft_bands, n_bands,
+                    frames_per_group=frames_per_group, **kwargs)
+    mb_crest = run("Computing crest factors…", get_mb_crest_factor, grouped, **kwargs)
+    features = np.vstack((*amplitude_features, mb_entropy, mb_onset, mb_centroid,
+                          mb_flux, mb_zcr, mb_energy, mb_crest)).T[1:]
+    features = np.hstack((features, (amplitude_differences[1:].reshape(len(differences), -1))))
+    # features = np.hstack((features, differences.reshape(len(differences), -1)))
 
-    labels = run(f"Clustering differences…", hdbscan_difference, features, min_cluster_size, min_samples, cluster_selection_epsilon, alpha, metric, algorithm, power)
-    # f_labels = run(f"Filtering clusters into {n_clusters} groups…", filter_clusters, labels, mb_onset, n_clusters)
-
-    run("Plotting clusters…", plot_clusters_2d, features, labels)
+    canopy_labels = run("Estimating cluster count with Canopy…", canopy_difference, features, t1, t2)
+    n_clusters = len(np.unique(canopy_labels[canopy_labels >= 0]))
+    labels = run(f"Clustering into {n_clusters} groups with KMeans…", kmeans_difference, features, n_clusters)
+    coordinates = run("Computing PCA…", pca_difference, features)
+    run("Plotting clusters…", plot_clusters_3d, coordinates, labels)
 
     if progress is not None:
         progress(1.0, "Analysis complete")
-    return labels
+    return np.r_[-1, labels]  # The first frame has no preceding frame to compare.

@@ -27,18 +27,14 @@ def analyze(data, progress, **parameters):
 st.title("Stems recognition")
 upload = st.file_uploader("Drop or choose music", type=["mp3", "wav", "flac", "ogg", "m4a"],
                           on_change=lambda: st.session_state.pop("result", None))
-defaults = dict(frames_per_group=2, n_bands=100, min_cluster_size=10, min_samples=10, split_size=0.2, cluster_selection_epsilon=0.0, alpha=1.0, power=0.5)
+defaults = dict(frames_per_group=2, n_bands=100, t1=6., t2=3., power=1., split_size=0.1)
 with st.form("parameters"):
     fields = {name: st.text_input(name, str(value)) for name, value in defaults.items()}
-    algorithm = st.selectbox("algorithm", ["auto", "brute", "kd_tree", "ball_tree"])
-    metric = st.selectbox("metric", ["euclidean", "manhattan", "cosine", "chebyshev", "correlation"],
-                          help="Cosine and correlation require algorithm auto or brute.")
+    st.caption("Canopy distances: t1 is the loose membership radius; t2 is the tight seed-removal radius. Require 0 < t2 < t1.")
     submitted = st.form_submit_button("Analyze audio", disabled=upload is None)
 if submitted:
     try:
         parameters = {name: type(defaults[name])(value) for name, value in fields.items()}
-        parameters["algorithm"] = algorithm
-        parameters["metric"] = metric
         bar = st.progress(0, text="Reading audio…")
         result = analyze(upload.getvalue(), bar.progress, **parameters)
         st.session_state.result = result
